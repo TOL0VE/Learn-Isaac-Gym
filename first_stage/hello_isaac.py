@@ -25,7 +25,10 @@ gym.add_ground(sim, plane_params)
 
 # 2. 加载 Go1 (应用 Dog B 的解药)
 asset_root = "."
+# asset_root = "/home/oiioaa/Desktop/isaacgym/assets"
 asset_file = "go1_description/urdf/go1.urdf" # 切回你的 Go1 路径
+# asset_file = "urdf/cartpole.urdf" # 
+
 
 asset_options = gymapi.AssetOptions()
 # === 【Dog B 核心配方】 ===
@@ -90,17 +93,17 @@ while not gym.query_viewer_has_closed(viewer):
     t += 0.02
     
     # === 简单的控制律：让它做深蹲 ===
-    # 保持 Hip 不变，同时动大腿和小腿
-    actions = default_dof_pos.copy()
-    offset = np.sin(t * 3.0) * 0.3 # 幅度 0.3，频率 3.0
+    # # 保持 Hip 不变，同时动大腿和小腿
+    # actions = default_dof_pos.copy()
+    # offset = np.sin(t * 3.0) * 0.3 # 幅度 0.3，频率 3.0
     
-    # 让四条腿同步动
-    for i in range(4):
-        actions[3*i + 1] += offset      # Thigh 动
-        actions[3*i + 2] -= offset * 1.5 # Calf 反向动多一点 (保持足端接触)
+    # # 让四条腿同步动
+    # for i in range(4):
+    #     actions[3*i + 1] += offset      # Thigh 动
+    #     actions[3*i + 2] -= offset * 1.5 # Calf 反向动多一点 (保持足端接触)
 
-    # 发送动作
-    gym.set_actor_dof_position_targets(env, actor_handle, actions)
+    # # 发送动作
+    # gym.set_actor_dof_position_targets(env, actor_handle, actions)
 
     # 物理步进
     gym.simulate(sim)
