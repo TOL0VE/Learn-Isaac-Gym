@@ -4,11 +4,14 @@ import numpy as np
 
 class CartPoleEnv:
     def __init__(self, num_envs=512):
+        self.control_steps = 2  # 每个动作执行多少个物理步长
+
         self.gym = gymapi.acquire_gym()
         self.sim_params = gymapi.SimParams()
         self.sim_params.physx.use_gpu = True
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
         self.sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.81)
+        self.sim_params.dt = 0.01
         
         # 选择显卡
         self.device = "cuda:0"
@@ -78,9 +81,9 @@ class CartPoleEnv:
         # 施加力矩
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(forces))
         
-        # 物理步进
-        self.gym.simulate(self.sim)
-        self.gym.fetch_results(self.sim, True)
+        for _ in range(self.control_steps):
+            self.gym.simulate(self.sim)
+            self.gym.fetch_results(self.sim, True)
         
         # 计算 Reward (关键！)
         # 目标：

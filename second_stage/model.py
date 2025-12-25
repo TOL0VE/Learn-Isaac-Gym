@@ -74,6 +74,7 @@ class CartPoleActorCritic(nn.Module):
         mu, std, value, next_hidden = self.forward(x, hidden_states)
         dist = Normal(mu, std)
         
+        '''它定义了你的 AI 是在“尝试新招式（训练）”还是在“展示最佳水平（测试）”。'''
         if deterministic:
             action = mu
         else:

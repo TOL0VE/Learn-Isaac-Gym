@@ -13,7 +13,7 @@ from model import CartPoleActorCritic
 # Hyperparameters (超参数)
 # ==========================================
 MAX_ITERATIONS = 2000       # 稍微增加一点，让你能看到更长的曲线
-NUM_STEPS = 24              
+NUM_STEPS = 50              
 NUM_ENVS = 512              
 SAVE_INTERVAL = 100          
 LEARNING_RATE = 3e-4        
@@ -24,6 +24,7 @@ VALUE_LOSS_COEF = 0.5
 ENTROPY_COEF = 0.01         
 MAX_GRAD_NORM = 0.5         
 PPO_EPOCHS = 4              
+
 
 device = "cuda:0"
 
@@ -58,10 +59,13 @@ def train():
         buffer = {'obs': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': [], 'values': []}
         
         initial_hidden = (hidden_state[0].detach(), hidden_state[1].detach())
+        # .detach() 意思是：
+        # "把你身上的数值复制一份给我，但是把梯度链条剪断！"
+        # 现在的 initial_hidden 就是单纯的数字张量，没有任何历史包袱。
         hidden_state = initial_hidden 
 
         for step in range(NUM_STEPS):
-            with torch.no_grad():
+            with torch.no_grad(): #接下来这几行代码，你只管算结果，不要记录梯度
                 action, log_prob, value, next_hidden = model.get_action(
                     obs.unsqueeze(0), hidden_state
                 )
@@ -81,17 +85,20 @@ def train():
             hidden_state = (h * mask, c * mask)
         
         # ... (Phase 2: GAE 代码不变) ...
+        # （贝尔曼方程）：当前价值 = 当前奖励 + 折扣因子 * 下一步价值
         with torch.no_grad():
             _, _, next_value, _ = model.get_action(obs.unsqueeze(0), hidden_state)
             next_value = next_value.squeeze(0)
 
-        b_obs = torch.stack(buffer['obs']) 
-        b_actions = torch.stack(buffer['actions'])
-        b_log_probs = torch.stack(buffer['log_probs'])
-        b_values = torch.stack(buffer['values'])
-        b_rewards = torch.stack(buffer['rewards'])
-        b_dones = torch.stack(buffer['dones'])
-
+        b_obs = torch.stack(buffer['obs'])  #[ Tensor(512, 5), Tensor(512, 5), ... (共24个) ]-> Tensor(时间步, 环境数, 特征数)
+        b_actions = torch.stack(buffer['actions']) #[ Tensor(512, 1), Tensor(512, 1), ... (共24个) ]-> Tensor(时间步, 环境数, 动作维度)
+        b_log_probs = torch.stack(buffer['log_probs']) #[ Tensor(512, 1), Tensor(512, 1), ... (共24个) ]-> Tensor(时间步, 环境数, 1)
+        b_values = torch.stack(buffer['values'])# [ Tensor(512, 1), Tensor(512, 1), ... (共24个) ]-> Tensor(时间步, 环境数, 1)
+        b_rewards = torch.stack(buffer['rewards']) #[ Tensor(512, 1), Tensor(512, 1), ... (共24个) ]-> Tensor(时间步, 环境数, 1)
+        b_dones = torch.stack(buffer['dones']) #[ Tensor(512, 1), Tensor(512, 1), ... (共24个) ]-> Tensor(时间步, 环境数, 1)
+        
+        # 计算 disconuntewd rewards(Gt) 和 GAE advantages
+        # advantages -> action value
         advantages = torch.zeros_like(b_rewards)
         last_gae_lam = 0
         
@@ -102,11 +109,17 @@ def train():
             else:
                 next_non_terminal = 1.0 - b_dones[t+1].float()
                 next_val = b_values[t+1]
-            
+            #TD Error
             delta = b_rewards[t] + GAMMA * next_val * next_non_terminal - b_values[t]
+            #Monte Carlo (蒙特卡洛) 和 TD(0) GAE 是这两个的混血儿
             advantages[t] = last_gae_lam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * last_gae_lam
         
-        returns = advantages + b_values
+
+        #这行代码只是个简单的数学恒等式变换：$$\text{Return} = \text{Advantage} + \text{Value}$$
+        # 因为 Advantage 的定义本来就是：“实际回报 ($Q$ 或 $R$) 减去 预期价值 ($V$)”。
+        returns = advantages + b_values   #returns -> value target
+
+
 
         # ... (Phase 3: PPO Update 代码不变) ...
         b_obs = b_obs.detach()
@@ -123,22 +136,30 @@ def train():
         for _ in range(PPO_EPOCHS):
             new_action_mean, new_action_std, new_values, _ = model(b_obs, initial_hidden)
             
-            dist = torch.distributions.Normal(new_action_mean, new_action_std)
-            new_log_probs = dist.log_prob(b_actions).sum(dim=-1, keepdim=True)
-            entropy = dist.entropy().sum(dim=-1).mean()
+            dist = torch.distributions.Normal(new_action_mean, new_action_std) 
+            new_log_probs = dist.log_prob(b_actions).sum(dim=-1, keepdim=True) 
+            entropy = dist.entropy().sum(dim=-1).mean() #KL散度make policy more diverse
             
-            ratio = torch.exp(new_log_probs - b_log_probs)
-            surr1 = ratio * b_advantages
+            # 核心公式：Ratio = P_new / P_old
+            # 在对数空间里：Ratio = exp(log_P_new - log_P_old)
+            ratio = torch.exp(new_log_probs - b_log_probs) #policy theta / policy theta old
+            surr1 = ratio * b_advantages 
             surr2 = torch.clamp(ratio, 1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON) * b_advantages
             actor_loss = -torch.min(surr1, surr2).mean()
             
-            value_loss = 0.5 * ((new_values - b_returns) ** 2).mean()
+            value_loss = 0.5 * ((new_values - b_returns) ** 2).mean() #make value closer to return(value target)
+
             loss = actor_loss + VALUE_LOSS_COEF * value_loss - ENTROPY_COEF * entropy
             
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
-            optimizer.step()
+            '''
+            梯度裁剪 (Gradient Clipping)
+            在训练（尤其是 RL 和 LSTM）时，有时候 Loss 表面会非常陡峭。
+            它不是简单地砍掉超出的部分，而是 “等比例缩小”。
+            '''
+            optimizer.step()# theta t+1 = ********
 
             # 累加 Loss
             avg_actor_loss += actor_loss.item()
