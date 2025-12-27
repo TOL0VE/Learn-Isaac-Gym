@@ -12,10 +12,15 @@ class CartPoleEnv:
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
         self.sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.81)
         self.sim_params.dt = 0.01
+        # ✅ 务必加上这行！让物理引擎的数据直接留在 GPU 上
+        self.sim_params.use_gpu_pipeline = True
         
         # 选择显卡
         self.device = "cuda:0"
         self.sim = self.gym.create_sim(0, 0, gymapi.SIM_PHYSX, self.sim_params)
+
+        self.viewer = None
+        # self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
         
         # 1. 加载 CartPole 资产
         asset_root = "/home/oiioaa/Desktop/isaacgym/assets"
@@ -84,27 +89,69 @@ class CartPoleEnv:
         for _ in range(self.control_steps):
             self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
+
+            # 渲染逻辑也可以放在这
+            if self.viewer:
+                self.gym.step_graphics(self.sim)
+                self.gym.draw_viewer(self.viewer, self.sim, True)
+                self.gym.sync_frame_time(self.sim)
         
         # 计算 Reward (关键！)
         # 目标：
         # 1. 杆子竖直 (PoleAngle -> 0)
         # 2. 小车速度追踪指令 (CartVel -> Command)
         
+        # --- 1. 获取状态 ---
+        # 假设 root_states 顺序是 [cart_pos, cart_vel, pole_angle, pole_vel]
         cart_vel = self.root_states[:, 1]
         pole_angle = self.root_states[:, 2]
+        pole_vel = self.root_states[:, 3]
         target_vel = self.commands.squeeze()
+
+        print("Pole Angles:", pole_angle.item())
         
-        # 奖励函数设计
-        r_angle = -torch.abs(pole_angle) # 越直越好
-        r_vel = -torch.abs(cart_vel - target_vel) # 速度越准越好
-        reward = 1.0 + r_angle + r_vel # 1.0 是活着奖励
+        # --- 2. 定义惩罚项 (Penalties) ---
         
-        # 判断是否结束 (杆子倒了 > 0.4 rad)
-        reset_env_ids = torch.abs(pole_angle) > 0.4
+        # A. 角度惩罚 (主要目标)
+        # 用平方替代绝对值，对小误差更宽容，对大误差更严厉
+        # 结果范围: 偏离越大，负分越多
+        r_angle = -1.0 * (pole_angle ** 2)
         
-        # 自动 Reset 倒了的环境
-        if torch.any(reset_env_ids):
-            self.reset(reset_env_ids)
+        # B. 速度追踪惩罚 (次要目标)
+        # 同样用平方误差
+        r_vel = -0.5 * ((cart_vel - target_vel) ** 2)
+        
+        # C. 稳定性惩罚 (你的需求：限制棒子角速度)
+        # 防止棒子虽然立着但是像钟摆一样疯狂晃动
+        r_pole_stable = -0.05 * (pole_vel ** 2)
+        
+        # D. 动作平滑惩罚 (可选，但推荐)
+        # 防止电机输出过大，或者在 -1 和 1 之间高频切换
+        # actions 是你这一步输出的力矩
+        r_action = -0.01 * (forces[:, 0] ** 2)
+        
+        # --- 3. 计算总奖励 ---
+        # 1.0 是活着的基础奖励 (Survival Bonus)
+        reward = 1.0 + r_angle*4 + r_vel + r_pole_stable + r_action
+        
+        # --- 4. 判断结束条件 (Reset) ---
+        reset_threshold = 0.5
+        reset_env_ids = torch.abs(pole_angle) > reset_threshold
+        
+        # --- 5. 施加“死亡惩罚” (Reset Penalty) ---
+        # 如果这一步挂了，直接扣 100 分 (或者 -10.0，看你数值尺度)
+        # torch.where(condition, if_true, if_false)
+        reward = torch.where(reset_env_ids, reward - 10.0, reward)
+        
+        # --- 6. 执行 Reset ---
+        # 还需要检查小车是否跑出地图 (例如 x > 2.0)
+        out_of_bounds = torch.abs(self.root_states[:, 0]) > 2.4 # 滑轨长度限制
+        reset_env_ids = reset_env_ids | out_of_bounds # 合并两个条件
+        
+        # if torch.any(reset_env_ids):
+        #     # 注意：这里的 reset 需要你也重置 buffer 里的 reward 吗？
+        #     # 通常不需要，因为 reward 是立刻返回给 PPO 的
+        #     self.reset(reset_env_ids)
             
         return self.get_obs(), reward, reset_env_ids
 
@@ -116,11 +163,10 @@ class CartPoleEnv:
             if num_resets == 0: return
 
             # 2. 生成随机初始状态 (只针对需要重置的那几个)
-            # 范围控制在 [-0.1, 0.1] 之间，给一点随机扰动
             # shape: (num_resets, 2) -> (Cart位置, Pole角度)
-            positions = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 0.2
+            positions = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 3
             # shape: (num_resets, 2) -> (Cart速度, Pole角速度)
-            velocities = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 0.2
+            velocities = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 1.0
 
             # 3. 更新 Tensor 视图 (最关键的一步)
             # 还记得我们在 __init__ 里做的那个 .view() 吗？
@@ -155,4 +201,4 @@ class CartPoleEnv:
             # # 2. 转换成 float 并减去 1 -> 变成 -1.0, 0.0, 1.0
             # self.commands[indices] = rand_ints.float() - 1.0
 
-            self.commands[indices] = (torch.rand((num_resets, 1), device=self.device) * 4.0) - 2.0
+            self.commands[indices] = (torch.rand((num_resets, 1), device=self.device) -0.5) * 2.0*4.0

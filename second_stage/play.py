@@ -1,3 +1,5 @@
+import isaacgym
+
 import torch
 from isaacgym import gymapi
 # 引入上面写的类
@@ -22,13 +24,18 @@ def run():
     model = CartPoleActorCritic().to("cuda:0")
     
     # 这里假设你已经有了训练好的权重
-    # model.load_state_dict(torch.load("cartpole_lstm.pth"))
-    
+    checkpoint = torch.load("/home/oiioaa/Desktop/Learn-Isaac-Gym/second_stage/latest_model.pth",map_location="cuda:0")
+    model.load_state_dict(checkpoint['model_state_dict'])    
+
     # 注册键盘事件
     viewer = env.gym.create_viewer(env.sim, gymapi.CameraProperties())
     env.gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_A, "MOVE_LEFT")
     env.gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_D, "MOVE_RIGHT")
     env.gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_S, "STOP")
+    env.viewer = viewer
+
+    env.reset(torch.ones(1, dtype=torch.long, device="cuda:0"))
+    
     
     obs = env.get_obs()
     # LSTM 隐藏状态初始化
