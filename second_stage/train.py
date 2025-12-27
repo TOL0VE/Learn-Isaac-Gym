@@ -17,19 +17,20 @@ import os
 # ==========================================
 # Hyperparameters (超参数)
 # ==========================================
-MAX_ITERATIONS = 5000       # 稍微增加一点，让你能看到更长的曲线
-NUM_STEPS = 24*2          
-MINI_BATCH_SIZE = 1024   
-NUM_ENVS = 4096*40          
+MAX_ITERATIONS = 50000       # 稍微增加一点，让你能看到更长的曲线
+NUM_STEPS = 24     
+MINI_BATCH_SIZE = 4096*2
+NUM_ENVS = 4096*2      
 SAVE_INTERVAL = 100          
-LEARNING_RATE = 3e-4        
+LEARNING_RATE = 3e-4   
+
 GAMMA = 0.99                
 GAE_LAMBDA = 0.95           
 CLIP_EPSILON = 0.2          
 VALUE_LOSS_COEF = 0.5       
 ENTROPY_COEF = 0.01         
 MAX_GRAD_NORM = 0.5         
-PPO_EPOCHS = 5              
+PPO_EPOCHS = 3             
 
 
 def save_checkpoint(model, optimizer, iteration, log_dir, filename="checkpoint.pth"):
@@ -51,7 +52,7 @@ def save_checkpoint(model, optimizer, iteration, log_dir, filename="checkpoint.p
 def load_checkpoint(model, optimizer, load_path):
     """加载模型和训练状态"""
     print(f"--> 正在加载模型: {load_path}")
-    checkpoint = torch.load(load_path)
+    checkpoint = torch.load(load_path,map_location="cuda:0")
     
     # 恢复模型参数
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -82,7 +83,7 @@ def train():
     model = CartPoleActorCritic(num_obs=5, num_actions=1).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    LOAD_PATH = "/home/oiioaa/Desktop/Learn-Isaac-Gym/second_stage/latest_model.pth" # 你想加载的文件路径
+    LOAD_PATH = "/home/gdp/second_stage/final_model.pth" # 你想加载的文件路径
     resume = True  # 🔴 开关：True=接着练，False=重头练
     
     start_iter = 0
@@ -94,10 +95,6 @@ def train():
         torch.zeros(1, NUM_ENVS, model.hidden_size).to(device),
         torch.zeros(1, NUM_ENVS, model.hidden_size).to(device)
     )
-
-
-
-    
 
     print(f"开始训练! Device: {device}, Envs: {NUM_ENVS}")
     try:
@@ -123,14 +120,21 @@ def train():
                 torch.zeros(1, NUM_ENVS, model.hidden_size).to(device),
                 torch.zeros(1, NUM_ENVS, model.hidden_size).to(device)
             )
-
+            # print("Starting new iteration rollout...")
+            epoch_reward_tracker = {
+                'rew_angle': 0.0,
+                'rew_vel': 0.0,
+                'rew_stable': 0.0,
+                'rew_action': 0.0,
+                'raw_total': 0.0
+            }
             for step in range(NUM_STEPS):
                 with torch.no_grad(): #接下来这几行代码，你只管算结果，不要记录梯度
                     action, log_prob, value, next_hidden = model.get_action(
                         obs.unsqueeze(0), hidden_state
                     )
 
-                next_obs, reward, done = env.step(action.squeeze(0))
+                next_obs, reward, done,reward_info = env.step(action.squeeze(0),step,NUM_STEPS)
 
                 buffer['obs'].append(obs)
                 buffer['actions'].append(action.squeeze(0)) 
@@ -138,11 +142,14 @@ def train():
                 buffer['values'].append(value.squeeze(0))
                 buffer['rewards'].append(reward)
                 buffer['dones'].append(done)
+                for key in epoch_reward_tracker:
+                    epoch_reward_tracker[key] += reward_info[key]
 
                 obs = next_obs
                 h, c = next_hidden
                 mask = (1.0 - done.float()).view(1, -1, 1) 
                 hidden_state = (h * mask, c * mask)
+            # print("Rollout completed.")
             
             # ... (Phase 2: GAE 代码不变) ...
 
@@ -201,7 +208,7 @@ def train():
             avg_actor_loss = 0
             avg_value_loss = 0
             avg_entropy = 0
-
+            # print("Starting PPO update...")
             for epoch in range(PPO_EPOCHS):
                 # 每次打乱环境顺序（这是 SGD 的精髓，增加随机性）
                 perm = torch.randperm(NUM_ENVS)
@@ -244,6 +251,7 @@ def train():
                     # ---------------------------------------------------
                     # 4. 计算 Loss
                     # ---------------------------------------------------
+                    # 这里的 dist 才是 Policy π(a|s) 的本体！
                     dist = torch.distributions.Normal(new_mean, new_std)
                     new_log_probs = dist.log_prob(mb_actions).sum(dim=-1) 
                     
@@ -276,7 +284,7 @@ def train():
                 avg_actor_loss += actor_loss.item()
                 avg_value_loss += value_loss.item()
                 avg_entropy += entropy.item()
-
+            # print("PPO update completed.")
             # 取平均
             avg_actor_loss /= PPO_EPOCHS
             avg_value_loss /= PPO_EPOCHS
@@ -305,13 +313,18 @@ def train():
             current_std = model.actor_log_std.exp().mean().item()
             writer.add_scalar('Policy/Action_Std', current_std, iteration)
 
+
+            for key, total_value in epoch_reward_tracker.items():
+                avg_value = total_value / NUM_STEPS  # 算出平均每一步拿多少分
+                writer.add_scalar(f'Rewards/{key}', avg_value, iteration)
+
             # 终端打印简化，详细的去 TensorBoard 看
             if iteration % SAVE_INTERVAL == 0:
                 print(f"Iter {iteration}: Reward={mean_reward:.2f}, Failures={int(total_failures)}, Std={current_std:.2f}")
                 save_checkpoint(model, optimizer, iteration, log_dir, "latest_model.pth")
             
-            if iteration % 10 == 0:
-                print(f"Iter {iteration}: Reward={mean_reward:.2f}, Failures={int(total_failures)}, Std={current_std:.2f}")
+            # if iteration % 10 == 0:
+            #     print(f"Iter {iteration}: Reward={mean_reward:.2f}, Failures={int(total_failures)}, Std={current_std:.2f}")
 
             # if avg_reward > 450: # 假设满分 500
             #             save_checkpoint(model, optimizer, iteration, log_dir, f"best_reward_{int(avg_reward)}.pth")

@@ -59,6 +59,7 @@ class CartPoleActorCritic(nn.Module):
         out_flat = lstm_out.view(-1, self.hidden_size)
         
         action_mean = self.actor_mean(out_flat)
+        action_mean = torch.tanh(action_mean)
         value = self.critic(out_flat)
         action_std = self.actor_log_std.exp().expand_as(action_mean)
         

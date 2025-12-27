@@ -24,7 +24,7 @@ def run():
     model = CartPoleActorCritic().to("cuda:0")
     
     # 这里假设你已经有了训练好的权重
-    checkpoint = torch.load("/home/oiioaa/Desktop/Learn-Isaac-Gym/second_stage/latest_model.pth",map_location="cuda:0")
+    checkpoint = torch.load("/home/oiioaa/Desktop/Learn-Isaac-Gym/second_stage/final_model.pth",map_location="cuda:0")
     model.load_state_dict(checkpoint['model_state_dict'])    
 
     # 注册键盘事件
@@ -49,9 +49,10 @@ def run():
         # 输入维度增加 sequence 维度 [1, 1, 5]
         with torch.no_grad():
             action, _, _, hidden = model.get_action(obs.unsqueeze(0), hidden, deterministic=True)
+        
             
         # 3. 环境步进
-        obs, reward, done = env.step(action)
+        obs, reward, done ,_= env.step(action,0,0)
         
         # 4. 渲染
         env.gym.draw_viewer(viewer, env.sim, True)

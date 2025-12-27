@@ -14,6 +14,14 @@ class CartPoleEnv:
         self.sim_params.dt = 0.01
         # ✅ 务必加上这行！让物理引擎的数据直接留在 GPU 上
         self.sim_params.use_gpu_pipeline = True
+        # 倍率扩容
+        # 默认是 1。设为 4 或 8，会成倍增加所有物理缓冲区的预分配大小
+        self.sim_params.physx.default_buffer_size_multiplier = 4.0 
+        # 2. 增加最大 GPU 接触对数量 (以防万一)
+        # 默认通常是 1024*1024 (1M)。给它加到 8M 或 16M
+        self.sim_params.physx.max_gpu_contact_pairs = 8 * 1024 * 1024 
+        # 3. 增加接触点缓冲 (也是以防万一)
+        self.sim_params.physx.max_gpu_contact_pairs = 8 * 1024 * 1024
         
         # 选择显卡
         self.device = "cuda:0"
@@ -77,11 +85,12 @@ class CartPoleEnv:
         obs = torch.cat([self.root_states, self.commands], dim=1)
         return obs
 
-    def step(self, actions):
+    def step(self, actions,step,NUM_STEPS):
         # actions: (num_envs, 1) -> 力矩
         # 需要转换成 tensor 格式喂给 Isaac Gym
         forces = torch.zeros((self.num_envs, 2), device=self.device, dtype=torch.float32)
-        forces[:, 0] = actions.squeeze() * 20.0 # 放大力矩，否则推不动
+        forces[:, 0] = actions.squeeze() * 100.0 # 放大力矩，否则推不动
+        print(f"Action: {actions.squeeze().cpu().numpy()* 100.0}")
         
         # 施加力矩
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(forces))
@@ -108,52 +117,79 @@ class CartPoleEnv:
         pole_vel = self.root_states[:, 3]
         target_vel = self.commands.squeeze()
 
-        print("Pole Angles:", pole_angle.item())
         
         # --- 2. 定义惩罚项 (Penalties) ---
         
-        # A. 角度惩罚 (主要目标)
-        # 用平方替代绝对值，对小误差更宽容，对大误差更严厉
-        # 结果范围: 偏离越大，负分越多
-        r_angle = -1.0 * (pole_angle ** 2)
+        # --- 1. 预处理：角度归一化 (Swing-Up 必做！) ---
+        # Isaac Gym 的 pole_angle 是累积的 (比如转一圈是 6.28)。
+        # 对于平方惩罚，必须把角度“折叠”回 [-π, π] 区间。
+        # 否则：杆子甩上去变成 2π (约6.28)，平方后是 40，惩罚爆表，AI 就不敢甩了。
+        pole_angle_wrapped = (pole_angle + torch.pi) % (2 * torch.pi) - torch.pi
         
-        # B. 速度追踪惩罚 (次要目标)
-        # 同样用平方误差
-        r_vel = -0.5 * ((cart_vel - target_vel) ** 2)
+        # --- 2. 定义惩罚项 ---
         
-        # C. 稳定性惩罚 (你的需求：限制棒子角速度)
-        # 防止棒子虽然立着但是像钟摆一样疯狂晃动
+        # A. 角度惩罚 (使用折叠后的角度)
+        # 目标是让 wrapped 角度归 0
+        r_angle = -10.0 * (pole_angle_wrapped ** 2)
+        
+        # B. 速度惩罚
+        r_vel = -0.2 * ((cart_vel - target_vel) ** 2)
+        
+        # C. 稳定性惩罚
         r_pole_stable = -0.05 * (pole_vel ** 2)
         
-        # D. 动作平滑惩罚 (可选，但推荐)
-        # 防止电机输出过大，或者在 -1 和 1 之间高频切换
-        # actions 是你这一步输出的力矩
-        r_action = -0.01 * (forces[:, 0] ** 2)
+        # D. 动作惩罚
+        r_action = -0.01 * (actions.squeeze() ** 2)
+
+        # --- 3. 安全区遮罩 (Masking) ---
+        # 只有当杆子比较直 (±0.4 rad, 约24度) 时，才开始考虑速度和省力
+        # 甩杆过程中(不安全时)，只专注于 r_angle，其他忽略
+        is_safe = torch.abs(pole_angle_wrapped) < 0.4 
         
-        # --- 3. 计算总奖励 ---
-        # 1.0 是活着的基础奖励 (Survival Bonus)
-        reward = 1.0 + r_angle*4 + r_vel + r_pole_stable + r_action
+        r_vel = torch.where(is_safe, r_vel, torch.zeros_like(r_vel))
+        r_pole_stable = torch.where(is_safe, r_pole_stable, torch.zeros_like(r_pole_stable))
+        r_action = torch.where(is_safe, r_action, torch.zeros_like(r_action))
         
-        # --- 4. 判断结束条件 (Reset) ---
-        reset_threshold = 0.5
-        reset_env_ids = torch.abs(pole_angle) > reset_threshold
+        # --- 4. 计算总奖励 ---
+        # ✅ 加 1.0 活着奖励，防止负分太多导致 AI 自杀
+        reward = 1.0 + r_angle + r_pole_stable + r_vel + r_action
         
-        # --- 5. 施加“死亡惩罚” (Reset Penalty) ---
-        # 如果这一步挂了，直接扣 100 分 (或者 -10.0，看你数值尺度)
-        # torch.where(condition, if_true, if_false)
-        reward = torch.where(reset_env_ids, reward - 10.0, reward)
+        # --- 5. 失败判定 (Reset Logic) ---
         
-        # --- 6. 执行 Reset ---
-        # 还需要检查小车是否跑出地图 (例如 x > 2.0)
-        out_of_bounds = torch.abs(self.root_states[:, 0]) > 2.4 # 滑轨长度限制
-        reset_env_ids = reset_env_ids | out_of_bounds # 合并两个条件
+        # A. 角度阈值 (Swing-Up 任务通常不设角度重置，或者设很大)
+        # 设为 2*PI 允许它甩一圈；如果设太小(3.14)可能会打断甩杆的动作
+        reset_threshold = 2 * 3.14 
+        pole_failed = torch.abs(pole_angle) > reset_threshold
         
-        # if torch.any(reset_env_ids):
-        #     # 注意：这里的 reset 需要你也重置 buffer 里的 reward 吗？
-        #     # 通常不需要，因为 reward 是立刻返回给 PPO 的
-        #     self.reset(reset_env_ids)
-            
-        return self.get_obs(), reward, reset_env_ids
+        # B. 出界判定 (绝对不能忍)
+        out_of_bounds = torch.abs(self.root_states[:, 0]) > 2.4
+        
+        # 合并所有失败条件
+        reset_env_ids = pole_failed | out_of_bounds
+
+        # --- 6. 死亡惩罚 (关键修正顺序) ---
+        # ❌ 原代码：出界(out_of_bounds)没有被包含在惩罚里，AI 会故意出界来骗分。
+        # ✅ 新代码：只要需要 Reset (无论是倒了还是出界)，统统扣分。
+        
+        # 如果是最后一步自然停止，不扣分；否则扣 20 分
+        # (这里简化处理，统一扣分，效果通常更稳)
+        penalty_mask = reset_env_ids & (step < NUM_STEPS - 1)
+        reward = torch.where(penalty_mask, reward - 20.0, reward)
+        
+        # --- 7. 执行 Reset ---
+        if torch.any(reset_env_ids):
+            self.reset(reset_env_ids)
+
+        # 返回 Info (用于 TensorBoard 调试)
+        reward_info = {
+            'rew_angle': r_angle.mean().item(),
+            'rew_vel': r_vel.mean().item(),
+            'rew_stable': r_pole_stable.mean().item(),
+            'rew_action': r_action.mean().item(),
+            'raw_total': reward.mean().item()
+        }
+        
+        return self.get_obs(), reward, reset_env_ids, reward_info
 
     def reset(self, env_ids):
             # env_ids 是一个 bool tensor (比如 [False, True, False...])
@@ -164,9 +200,9 @@ class CartPoleEnv:
 
             # 2. 生成随机初始状态 (只针对需要重置的那几个)
             # shape: (num_resets, 2) -> (Cart位置, Pole角度)
-            positions = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 3
+            positions = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 2 * 2 
             # shape: (num_resets, 2) -> (Cart速度, Pole角速度)
-            velocities = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 1.0
+            velocities = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 2 *4.0 * 0
 
             # 3. 更新 Tensor 视图 (最关键的一步)
             # 还记得我们在 __init__ 里做的那个 .view() 吗？
