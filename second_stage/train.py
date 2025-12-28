@@ -115,18 +115,14 @@ def train():
 
             obs = env.get_obs()
 
-                # 初始化 hidden state
-            hidden_state = (
-                torch.zeros(1, NUM_ENVS, model.hidden_size).to(device),
-                torch.zeros(1, NUM_ENVS, model.hidden_size).to(device)
-            )
             # print("Starting new iteration rollout...")
             epoch_reward_tracker = {
                 'rew_angle': 0.0,
                 'rew_vel': 0.0,
                 'rew_stable': 0.0,
                 'rew_action': 0.0,
-                'raw_total': 0.0
+                'raw_total': 0.0,
+                'rew_pos' : 0.0
             }
             for step in range(NUM_STEPS):
                 with torch.no_grad(): #接下来这几行代码，你只管算结果，不要记录梯度

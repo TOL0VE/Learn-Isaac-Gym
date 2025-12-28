@@ -52,6 +52,7 @@ def run():
         
             
         # 3. 环境步进
+        # obs[:,0] = 0.0  # 不让环境自己动，让小车只听命令
         obs, reward, done ,_= env.step(action,0,0)
         
         # 4. 渲染

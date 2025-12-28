@@ -90,7 +90,7 @@ class CartPoleEnv:
         # 需要转换成 tensor 格式喂给 Isaac Gym
         forces = torch.zeros((self.num_envs, 2), device=self.device, dtype=torch.float32)
         forces[:, 0] = actions.squeeze() * 100.0 # 放大力矩，否则推不动
-        print(f"Action: {actions.squeeze().cpu().numpy()* 100.0}")
+        # print(f"Action: {actions.squeeze().cpu().numpy()* 100.0}")
         
         # 施加力矩
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(forces))
@@ -112,10 +112,28 @@ class CartPoleEnv:
         
         # --- 1. 获取状态 ---
         # 假设 root_states 顺序是 [cart_pos, cart_vel, pole_angle, pole_vel]
+        cart_pos = self.root_states[:, 0]
         cart_vel = self.root_states[:, 1]
         pole_angle = self.root_states[:, 2]
         pole_vel = self.root_states[:, 3]
         target_vel = self.commands.squeeze()
+        wall_limit = 2.4
+        soft_limit = 2.1
+        safe_target_vel = target_vel.clone()
+        # 情况 A: 靠右墙太近 (> 2.1)
+        # 此时不管原始指令想要往哪跑，强制改成“往左回中” (比如 -1.0)
+        # 或者按你的要求，改成 0 (停车)，但在边界停车不如回头安全
+        # 建议：强制给一个反向速度，把车“推”回来
+        right_danger = cart_pos > soft_limit
+        safe_target_vel = torch.where(right_danger, -1.0 * torch.ones_like(safe_target_vel), safe_target_vel)
+        
+        # 情况 B: 靠左墙太近 (< -2.1)
+        # 强制改成“往右回中” (比如 +1.0)
+        left_danger = cart_pos < -soft_limit
+        safe_target_vel = torch.where(left_danger, 1.0 * torch.ones_like(safe_target_vel), safe_target_vel)
+
+        # 💡 如果只是想变 0
+        # safe_target_vel = torch.where(right_danger | left_danger, torch.zeros_like(safe_target_vel), safe_target_vel)
 
         
         # --- 2. 定义惩罚项 (Penalties) ---
@@ -130,16 +148,21 @@ class CartPoleEnv:
         
         # A. 角度惩罚 (使用折叠后的角度)
         # 目标是让 wrapped 角度归 0
-        r_angle = -10.0 * (pole_angle_wrapped ** 2)
+        r_angle = -5.0 * (pole_angle_wrapped ** 2)
         
         # B. 速度惩罚
-        r_vel = -0.2 * ((cart_vel - target_vel) ** 2)
+        r_vel = -0.5 * ((cart_vel - safe_target_vel) ** 2)
         
         # C. 稳定性惩罚
         r_pole_stable = -0.05 * (pole_vel ** 2)
         
         # D. 动作惩罚
         r_action = -0.01 * (actions.squeeze() ** 2)
+
+        # 位置惩罚 (Position Penalty)
+        # x=0时不扣分，x=2.0时扣 -4.0 分
+        # 这像一根橡皮筋，把它往中间拉
+        r_pos = -1.0 * (self.root_states[:, 0] ** 2)
 
         # --- 3. 安全区遮罩 (Masking) ---
         # 只有当杆子比较直 (±0.4 rad, 约24度) 时，才开始考虑速度和省力
@@ -152,7 +175,7 @@ class CartPoleEnv:
         
         # --- 4. 计算总奖励 ---
         # ✅ 加 1.0 活着奖励，防止负分太多导致 AI 自杀
-        reward = 1.0 + r_angle + r_pole_stable + r_vel + r_action
+        reward = 1.0 + r_angle + r_pole_stable + r_vel + r_action + r_pos
         
         # --- 5. 失败判定 (Reset Logic) ---
         
@@ -174,6 +197,7 @@ class CartPoleEnv:
         # 如果是最后一步自然停止，不扣分；否则扣 20 分
         # (这里简化处理，统一扣分，效果通常更稳)
         penalty_mask = reset_env_ids & (step < NUM_STEPS - 1)
+        reward = torch.where(out_of_bounds, reward - 100.0, reward)
         reward = torch.where(penalty_mask, reward - 20.0, reward)
         
         # --- 7. 执行 Reset ---
@@ -186,7 +210,8 @@ class CartPoleEnv:
             'rew_vel': r_vel.mean().item(),
             'rew_stable': r_pole_stable.mean().item(),
             'rew_action': r_action.mean().item(),
-            'raw_total': reward.mean().item()
+            'raw_total': reward.mean().item(),
+            'rew_pos': r_pos.mean().item()
         }
         
         return self.get_obs(), reward, reset_env_ids, reward_info
@@ -199,10 +224,7 @@ class CartPoleEnv:
             if num_resets == 0: return
 
             # 2. 生成随机初始状态 (只针对需要重置的那几个)
-            # shape: (num_resets, 2) -> (Cart位置, Pole角度)
-            positions = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 2 * 2 
-            # shape: (num_resets, 2) -> (Cart速度, Pole角速度)
-            velocities = (torch.rand((num_resets, 2), device=self.device) - 0.5) * 2 *4.0 * 0
+
 
             # 3. 更新 Tensor 视图 (最关键的一步)
             # 还记得我们在 __init__ 里做的那个 .view() 吗？
@@ -210,10 +232,10 @@ class CartPoleEnv:
             # 修改 self.root_states 会直接修改 self.dof_states 的内存！
             
             # 赋值逻辑：[indices] 挑出特定行，[0/1/2/3] 挑出特定列
-            self.root_states[indices, 0] = positions[:, 0]  # Cart Position
-            self.root_states[indices, 1] = velocities[:, 0] # Cart Velocity
-            self.root_states[indices, 2] = positions[:, 1]  # Pole Angle
-            self.root_states[indices, 3] = velocities[:, 1] # Pole Velocity
+            self.root_states[indices, 0] =  0.0  # Cart Position
+            self.root_states[indices, 1] =  (torch.rand((num_resets), device=self.device) - 0.5) * 2 * 2.0 # Cart Velocity
+            self.root_states[indices, 2] =  (torch.rand((num_resets), device=self.device) - 0.5) * 2 * 3.14  # Pole Angle
+            self.root_states[indices, 3] =  (torch.rand((num_resets), device=self.device) - 0.5) * 2 * 3.14  # Pole Velocity
 
             # 4. 通知物理引擎 (必须用 Int32 类型)
             actor_indices = indices.to(dtype=torch.int32)
@@ -236,5 +258,4 @@ class CartPoleEnv:
             # rand_ints = torch.rand(low=0, high=3, size=(num_resets, 1), device=self.device)
             # # 2. 转换成 float 并减去 1 -> 变成 -1.0, 0.0, 1.0
             # self.commands[indices] = rand_ints.float() - 1.0
-
-            self.commands[indices] = (torch.rand((num_resets, 1), device=self.device) -0.5) * 2.0*4.0
+            self.commands[indices] = (torch.rand((num_resets, 1), device=self.device) - 0.5) * 2 * 0
